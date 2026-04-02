@@ -128,7 +128,21 @@
 
 #define DP_PEER_TX_TID_INIT_DONE_BIT 0
 
+unsigned int retry_again = 1;
+module_param(retry_again, uint, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+qdf_export_symbol(retry_again);
+
 #ifdef WLAN_TX_PKT_CAPTURE_ENH
+
+#define CHECK_MPDUS_EXT_LIST(func, line, _mpdus_) \
+	{								\
+		qdf_nbuf_t ext;						\
+		ext = qdf_nbuf_get_ext_list(_mpdus_);			\
+		if (!ext)						\
+			dp_tx_capture_alert("%s : %d Fraglist is missing: mpdu=%p got=%p",\
+					func, line, _mpdus_, ext);			\
+	}
+
 
 #define CHECK_MPDUS_NULL(ptr_val)					\
 	{								\
@@ -228,6 +242,8 @@ static uint32_t dp_tx_capt_get_q_bytes(qdf_nbuf_queue_t *q)
 	return num_bytes;
 }
 
+int tx_capture_backlog_threshold[TX_CAP_BACKLOG_MAX] = { 10, 512, 1024};
+
 #ifdef WLAN_TX_PKT_CAPTURE_ENH_DEBUG
 
 #define TX_CAP_NBUF_QUEUE_FREE(q_head)					\
@@ -276,7 +292,7 @@ tx_cap_nbuf_queue_free_test(qdf_nbuf_queue_t *qhead,
 	}
 
 	if (len) {
-		dp_tx_capture_alert("Error actual len: [u], mem_free len: [%u]\n",
+		dp_tx_capture_alert("Error actual len: [%u], mem_free len: [%u]\n",
 				    actual_len, len);
 		QDF_BUG(0);
 	}
@@ -661,6 +677,10 @@ void dp_print_pdev_tx_capture_stats_1_0(struct dp_pdev *pdev)
 		       ptr_tx_cap->ppdu_stats_queue_depth);
 	DP_PRINT_STATS(" ppdu stats defer queue depth: %u",
 		       ptr_tx_cap->ppdu_stats_defer_queue_depth);
+	DP_PRINT_STATS(" ppdu dropped threshold: %u",
+		       ptr_tx_cap->ppdu_dropped);
+	DP_PRINT_STATS(" ppdu severe dropped threshold: %u",
+		       ptr_tx_cap->severe_ppdu_dropped);
 	DP_PRINT_STATS(" pending ppdu dropped: %u",
 		       ptr_tx_cap->pend_ppdu_dropped);
 	DP_PRINT_STATS(" peer mismatch: %llu",
@@ -669,6 +689,9 @@ void dp_print_pdev_tx_capture_stats_1_0(struct dp_pdev *pdev)
 		       ptr_tx_cap->ppdu_flush_count);
 	DP_PRINT_STATS(" ppdu msdu threshold drop: %u",
 		       ptr_tx_cap->msdu_threshold_drop);
+	DP_PRINT_STATS(" ppdu delivered to stack: %u",
+		       ptr_tx_cap->ppdu_delivered_to_stack);
+	DP_PRINT_STATS(" paylod miss: %u", ptr_tx_cap->payload_miss);
 	DP_PRINT_STATS(" mgmt control enqueue stats:");
 	for (i = 0; i < TXCAP_MAX_TYPE; i++) {
 		for (j = 0; j < TXCAP_MAX_SUBTYPE; j++) {
@@ -1785,6 +1808,7 @@ void dp_tx_ppdu_stats_attach_1_0(struct dp_pdev *pdev)
 	mon_pdev->tx_capture.ppdu_stats_queue_depth = 0;
 	mon_pdev->tx_capture.ppdu_stats_defer_queue_depth = 0;
 	mon_pdev->tx_capture.ppdu_dropped = 0;
+	mon_pdev->tx_capture.severe_ppdu_dropped = 0;
 
 	qdf_timer_init(NULL, &mon_pdev->tx_capture.work_q_timer,
 		       dp_tx_capture_work_q_timer_handler,
@@ -3217,9 +3241,11 @@ dp_tx_mon_restitch_mpdu(struct dp_pdev *pdev, struct dp_peer *peer,
 			qdf_nbuf_append_ext_list(mpdu_nbuf,
 						 first_nbuf,
 						 frag_list_sum_len);
+			CHECK_MPDUS_EXT_LIST(__func__, __LINE__, mpdu_nbuf);
 
 			/* add mpdu to mpdu queue */
 			qdf_nbuf_queue_add(mpdu_q, mpdu_nbuf);
+
 			first_nbuf = NULL;
 			mpdu_nbuf = NULL;
 
@@ -3424,6 +3450,7 @@ QDF_STATUS dp_tx_msdu_dequeue(struct dp_peer *peer, uint32_t ppdu_id,
 
 	/* store last dequeue time in msec */
 	tx_tid->last_deq_ms = qdf_system_ticks_to_msecs(qdf_system_ticks());
+
 	/* release lock here */
 	qdf_spin_unlock_bh(&tx_tid->tid_lock);
 
@@ -3480,6 +3507,76 @@ dp_tx_cap_nbuf_list_update_ref(struct dp_tx_cap_nbuf_list *ptr_nbuf_list,
 			       uint8_t ref_cnt)
 {
 	ptr_nbuf_list->ref_cnt = ref_cnt;
+}
+
+static inline
+int dp_tx_cap_transmit_cnt_dec(qdf_nbuf_t mpdu_nbuf)
+{
+	struct msdu_completion_info *ptr_msdu_info = NULL;
+	qdf_nbuf_t ext_nbuf;
+	uint8_t *ext_data;
+
+	if (!mpdu_nbuf) {
+		dp_tx_capture_err("txcap: NULL mpdu_nbuf");
+		return 0;
+	}
+
+	ext_nbuf = qdf_nbuf_get_ext_list(mpdu_nbuf);
+	if (!ext_nbuf) {
+		dp_tx_capture_alert("txcap: missing ext_list mpdu=%p",
+				  mpdu_nbuf);
+		return 0;
+	}
+
+	ext_data = qdf_nbuf_data(ext_nbuf);
+	if (!ext_data)
+		return 0;
+
+	ptr_msdu_info = (struct msdu_completion_info *)
+		(ext_data - (sizeof(struct msdu_completion_info) +
+			     sizeof(qdf_ether_header_t)));
+
+	if (qdf_unlikely(ptr_msdu_info->transmit_cnt <= 1))
+		return ptr_msdu_info->transmit_cnt;
+
+	ptr_msdu_info->transmit_cnt--;
+	return ptr_msdu_info->transmit_cnt;
+}
+
+static inline
+void dp_tx_cap_reset_retry_flag(qdf_nbuf_t mpdu_nbuf)
+{
+	uint8_t *hdr = (uint8_t *)qdf_nbuf_data(mpdu_nbuf);
+
+	if (!hdr || qdf_nbuf_len(mpdu_nbuf) < 2)
+		return;
+
+	hdr[1] &= (uint8_t)~IEEE80211_FC1_RETRY;
+}
+
+static inline
+qdf_nbuf_t dp_tx_cap_copy_expand(qdf_nbuf_t mpdu, int headroom, int tailroom)
+{
+	qdf_nbuf_t new_mpdu;
+	int dec_cnt;
+	uint8_t *hdr;
+
+	new_mpdu = qdf_nbuf_copy_expand_fraglist(mpdu, headroom, tailroom);
+	if (!new_mpdu)
+		return NULL;
+
+	CHECK_MPDUS_EXT_LIST(__func__, __LINE__, new_mpdu);
+
+	dec_cnt = dp_tx_cap_transmit_cnt_dec(mpdu);
+
+	hdr = (uint8_t *)qdf_nbuf_data(new_mpdu);
+	if (!hdr || qdf_nbuf_len(new_mpdu) < 2)
+		return new_mpdu;
+
+	if (dec_cnt == 1)
+		dp_tx_cap_reset_retry_flag(new_mpdu);
+
+	return new_mpdu;
 }
 
 /**
@@ -3576,7 +3673,9 @@ get_mpdu_clone_from_next_ppdu(struct dp_tx_cap_nbuf_list nbuf_list[],
 	if (!mpdu)
 		return NULL;
 
-	return qdf_nbuf_copy_expand_fraglist(mpdu, MAX_MONITOR_HEADER, 0);
+	CHECK_MPDUS_EXT_LIST(__func__, __LINE__, mpdu);
+
+	return dp_tx_cap_copy_expand(mpdu, MAX_MONITOR_HEADER, 0);
 }
 
 /**
@@ -3982,6 +4081,7 @@ void dp_send_data_to_stack(struct dp_pdev *pdev,
 			   struct cdp_tx_completion_ppdu *ppdu_desc,
 			   uint8_t usr_idx)
 {
+	struct dp_mon_pdev *mon_pdev = pdev->monitor_pdev;
 	struct cdp_tx_completion_ppdu_user *user = NULL;
 	struct cdp_tx_indication_info tx_capture_info;
 	struct cdp_tx_indication_mpdu_info *mpdu_info;
@@ -4038,6 +4138,8 @@ void dp_send_data_to_stack(struct dp_pdev *pdev,
 
 	if (!user->mpdus)
 		goto return_send_to_stack;
+
+	mon_pdev->tx_capture.ppdu_delivered_to_stack++;
 
 	mpdu_tried = user->mpdu_tried_ucast + user->mpdu_tried_mcast;
 
@@ -4301,6 +4403,7 @@ dp_tx_mon_proc_xretries(struct dp_pdev *pdev, struct dp_peer *peer,
 				} else {
 					index = seq_no - start_seq;
 					CHECK_MPDUS_NULL(user->mpdus[index]);
+					CHECK_MPDUS_EXT_LIST(__func__, __LINE__, mpdu_nbuf);
 					user->mpdus[index] =
 					qdf_nbuf_copy_expand_fraglist(
 						mpdu_nbuf,
@@ -4639,6 +4742,7 @@ dp_tx_mon_proc_pending_ppdus(struct dp_pdev *pdev, struct dp_tx_tid *tx_tid,
 						   user->start_seq + i,
 						   ppdu_desc->ppdu_id);
 				CHECK_MPDUS_NULL(user->mpdus[i]);
+				CHECK_MPDUS_EXT_LIST(__func__, __LINE__, mpdu_nbuf);
 				user->mpdus[i] =
 				qdf_nbuf_copy_expand_fraglist(
 					mpdu_nbuf, MAX_MONITOR_HEADER, 0);
@@ -4722,6 +4826,7 @@ dp_send_mgmt_ctrl_to_stack(struct dp_pdev *pdev,
 			   qdf_nbuf_t mgmt_ctl_nbuf,
 			   bool is_payload)
 {
+	struct dp_mon_pdev *mon_pdev = pdev->monitor_pdev;
 	struct cdp_tx_completion_ppdu *ppdu_desc;
 	struct cdp_tx_completion_ppdu_user *user;
 	struct cdp_tx_indication_mpdu_info *mpdu_info;
@@ -4806,6 +4911,8 @@ dp_send_mgmt_ctrl_to_stack(struct dp_pdev *pdev,
 				    wh_min->i_fc[1], wh_min->i_fc[0],
 				    wh_min->i_dur[1], wh_min->i_dur[0]);
 	}
+
+	mon_pdev->tx_capture.ppdu_delivered_to_stack++;
 
 	TX_CAP_WDI_EVENT_HANDLER(pdev->soc, pdev->pdev_id, ptr_tx_cap_info);
 
@@ -5774,6 +5881,7 @@ dp_check_ppdu_and_deliver(struct dp_pdev *pdev,
 							PEER_MPDU_CLONE, 1);
 
 					CHECK_MPDUS_NULL(user->mpdus[seq_idx]);
+					CHECK_MPDUS_EXT_LIST(__func__, __LINE__, mpdu_nbuf);
 					user->mpdus[seq_idx] = mpdu_nbuf;
 
 					SEQ_SEG(user->failed_bitmap, i) |=
@@ -5792,6 +5900,7 @@ dp_check_ppdu_and_deliver(struct dp_pdev *pdev,
 
 					index = seq_no - start_seq;
 					CHECK_MPDUS_NULL(user->mpdus[index]);
+					CHECK_MPDUS_EXT_LIST(__func__, __LINE__, mpdu_nbuf);
 					user->mpdus[index] = mpdu_nbuf;
 					dp_tx_cap_stats_mpdu_update(peer,
 							PEER_MPDU_ARR, 1);
@@ -5812,6 +5921,8 @@ dp_check_ppdu_and_deliver(struct dp_pdev *pdev,
 				if (!mpdu_nbuf)
 					continue;
 
+				CHECK_MPDUS_NULL(user->mpdus[seq_no - start_seq]);
+				CHECK_MPDUS_EXT_LIST(__func__, __LINE__, mpdu_nbuf);
 				user->mpdus[seq_no - start_seq] = mpdu_nbuf;
 				dp_tx_cap_stats_mpdu_update(peer,
 							    PEER_MPDU_ARR, 1);
@@ -5961,7 +6072,9 @@ dp_check_ppdu_and_deliver(struct dp_pdev *pdev,
 }
 
 static uint32_t
-dp_tx_cap_proc_per_ppdu_info(struct dp_pdev *pdev, qdf_nbuf_t nbuf_ppdu,
+dp_tx_cap_proc_per_ppdu_info(struct dp_pdev *pdev,
+			     struct dp_pdev_tx_capture *ptr_tx_cap,
+			     qdf_nbuf_t nbuf_ppdu,
 			     struct dp_tx_cap_nbuf_list nbuf_ppdu_list[],
 			     uint32_t ppdu_desc_cnt)
 {
@@ -6128,11 +6241,16 @@ dequeue_msdu_again:
 						 start_tsf,
 						 end_tsf);
 
-			if ((QDF_STATUS_E_AGAIN == ret) &&
-			    (++retries < 2)) {
-				/* wait for wbm to complete */
-				qdf_mdelay(2);
-				goto dequeue_msdu_again;
+			if (qdf_unlikely(!retry_again)) {
+				if (QDF_STATUS_E_AGAIN == ret)
+					ptr_tx_cap->payload_miss++;
+			} else {
+				if ((QDF_STATUS_E_AGAIN == ret) &&
+			   		 (++retries < 2)) {
+					/* wait for wbm to complete */
+					qdf_mdelay(2);
+					goto dequeue_msdu_again;
+				}
 			}
 
 			/*
@@ -6374,6 +6492,10 @@ dp_pdev_tx_cap_flush(struct dp_pdev *pdev, bool is_stats_queue_empty)
 			   delta_ms, is_stats_queue_empty);
 }
 
+#define PPDU_BACKLOG(mon_pdev)	\
+	(mon_pdev->tx_capture.ppdu_stats_queue_depth +\
+	 mon_pdev->tx_capture.ppdu_stats_defer_queue_depth)
+
 /**
  * dp_tx_ppdu_stats_process - Deferred PPDU stats handler
  * @context: Opaque work context (PDEV)
@@ -6575,9 +6697,17 @@ void dp_tx_ppdu_stats_process(void *context)
 			} else {
 				tx_cap_debugfs_log_ppdu_desc(pdev, nbuf_ppdu);
 
+				if (PPDU_BACKLOG(mon_pdev) >
+				    tx_capture_backlog_threshold[TX_CAP_SEVERE_BACKLOG]) {
+					mon_pdev->tx_capture.severe_ppdu_dropped++;
+					qdf_nbuf_free(nbuf_ppdu);
+					continue;
+				}
+
 				/* process ppdu_info on tx capture turned on */
 				ppdu_desc_cnt = dp_tx_cap_proc_per_ppdu_info(
 							pdev,
+							ptr_tx_cap,
 							nbuf_ppdu,
 							nbuf_ppdu_list,
 							ppdu_desc_cnt);
@@ -6713,12 +6843,12 @@ void dp_ppdu_desc_deliver_1_0(struct dp_pdev *pdev,
 		qdf_spin_lock_bh(&mon_pdev->tx_capture.ppdu_stats_lock);
 
 		if (qdf_unlikely((!mon_pdev->tx_capture_enabled &&
-				  (mon_pdev->tx_capture.ppdu_stats_queue_depth +
-				   mon_pdev->tx_capture.ppdu_stats_defer_queue_depth) >
-				  DP_TX_PPDU_PROC_MAX_DEPTH) ||
-				 !ppdu_desc->num_users)) {
+			(PPDU_BACKLOG(mon_pdev) >
+			 tx_capture_backlog_threshold[TX_CAP_HARD_BACKLOG])) ||
+			!ppdu_desc->num_users)) {
 			qdf_nbuf_free(s_ppdu_info->nbuf);
 			qdf_mem_free(s_ppdu_info);
+			/* do we need to update stats here */
 			mon_pdev->tx_capture.ppdu_dropped++;
 		} else {
 			STAILQ_INSERT_TAIL(&mon_pdev->tx_capture.ppdu_stats_queue,
@@ -6735,8 +6865,7 @@ void dp_ppdu_desc_deliver_1_0(struct dp_pdev *pdev,
 	mon_pdev->tx_capture.ppdu_stats_ms =
 				qdf_system_ticks_to_msecs(qdf_system_ticks());
 
-	if (mon_pdev->tx_capture.ppdu_stats_queue_depth >
-		DP_TX_PPDU_PROC_THRESHOLD) {
+	if (mon_pdev->tx_capture.ppdu_stats_queue_depth > tx_capture_backlog_threshold[TX_CAP_SOFT_BACKLOG]) {
 		qdf_queue_work(0, mon_pdev->tx_capture.ppdu_stats_workqueue,
 			       &mon_pdev->tx_capture.ppdu_stats_work);
 	}
