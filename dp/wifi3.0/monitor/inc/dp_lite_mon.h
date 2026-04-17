@@ -383,12 +383,14 @@ dp_lite_mon_get_filter_non_data(struct cdp_pdev *pdev_handle);
  *
  * @pdev: pdev context
  * @config: Lite monitor config
+ * @dir: direction
  *
  * Return: void
  **/
 void
 dp_lite_mon_free_peers(struct dp_pdev *pdev,
-		       struct dp_lite_mon_config *config);
+		       struct dp_lite_mon_config *config,
+		       uint8_t dir);
 
 #endif
 #endif /* _DP_LITE_MON_H_ */
