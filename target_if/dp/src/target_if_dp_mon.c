@@ -19,6 +19,7 @@
 #include <qdf_status.h>
 #include "target_if_dp_mon.h"
 #include <init_deinit_lmac.h>
+#include "wlan_utility.h"
 
 #ifdef QCA_SUPPORT_LITE_MONITOR
 int target_if_config_lite_mon_peer(struct cdp_ctrl_objmgr_psoc *psoc, uint8_t pdev_id,
