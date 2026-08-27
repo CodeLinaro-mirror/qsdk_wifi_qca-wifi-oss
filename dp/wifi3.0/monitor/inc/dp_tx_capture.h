@@ -80,6 +80,15 @@ struct dp_peer_tx_capture_stats {
 };
 #endif
 
+enum {
+	TX_CAP_SOFT_BACKLOG = 0,
+	TX_CAP_HARD_BACKLOG,
+	TX_CAP_SEVERE_BACKLOG,
+	TX_CAP_BACKLOG_MAX,
+};
+
+extern int tx_capture_backlog_threshold[TX_CAP_BACKLOG_MAX];
+
 struct dp_pdev_flush {
 	bool flush_all;
 	uint32_t now_ms;
@@ -136,12 +145,15 @@ struct dp_pdev_tx_capture {
 
 	uint32_t ppdu_stats_queue_depth;
 	uint32_t ppdu_stats_defer_queue_depth;
+	uint32_t payload_miss;
 	qdf_spinlock_t msdu_comp_q_list_lock;
 	qdf_timer_t work_q_timer;
 	uint32_t last_msdu_id;
 	uint16_t last_peer_id;
 	uint32_t ppdu_dropped;
+	uint32_t severe_ppdu_dropped;
 	uint32_t pend_ppdu_dropped;
+	uint32_t ppdu_delivered_to_stack;
 	qdf_nbuf_queue_t ctl_mgmt_q[TXCAP_MAX_TYPE][TXCAP_MAX_SUBTYPE];
 	qdf_nbuf_queue_t retries_ctl_mgmt_q[TXCAP_MAX_TYPE][TXCAP_MAX_SUBTYPE];
 	qdf_spinlock_t ctl_mgmt_lock[TXCAP_MAX_TYPE][TXCAP_MAX_SUBTYPE];
