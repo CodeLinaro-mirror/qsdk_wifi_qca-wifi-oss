@@ -42,6 +42,7 @@
 #endif
 
 #define _HT_SGI_PRESENT 0x80
+#define DP_MON_HT_MCS_NSS_OFFSET (1 << PHY_NSS_SHIFT)
 
 int wlan_cfg80211_set_mon_fcs_cap(struct wiphy *wiphy,
 				  struct wireless_dev *wdev,
@@ -828,6 +829,9 @@ convert_mpdu_info_to_stats(struct cdp_rx_indication_mpdu_info *mpdu_info,
 	    mpdu_info->preamble == DOT11_AX) {
 	    rx_status->ht_flags = 1;
 	    rx_status->ht_mcs = rx_status->mcs;
+	    if (mpdu_info->preamble == DOT11_N && rx_status->nss > 1)
+		rx_status->ht_mcs +=
+			DP_MON_HT_MCS_NSS_OFFSET * (rx_status->nss - 1);
 	    rx_status->rtap_flags |= 0x80;
 	}
 	rx_status->l_sig_a_info = mpdu_info->preamble |
