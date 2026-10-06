@@ -117,12 +117,14 @@ dp_lite_mon_update_vbss_info(struct dp_lite_mon_peer *new_peer,
  * dp_lite_mon_free_peers - free peers
  * @pdev: dp pdev context
  * @config: lite mon tx/rx config
+ * @dir: direction rx or tx
  *
  * Return: void
  */
 void
 dp_lite_mon_free_peers(struct dp_pdev *pdev,
-		       struct dp_lite_mon_config *config)
+		       struct dp_lite_mon_config *config,
+		       uint8_t dir)
 {
 	struct dp_lite_mon_peer *peer = NULL;
 	struct dp_lite_mon_peer *temp_peer = NULL;
@@ -137,14 +139,14 @@ dp_lite_mon_free_peers(struct dp_pdev *pdev,
 			   peer_list_elem, temp_peer) {
 		/* delete peer from the list */
 		TAILQ_REMOVE(&config->peer_list, peer, peer_list_elem);
-		if (config->direction == CDP_LITE_MON_DIRECTION_RX) {
+		if (dir == CDP_LITE_MON_DIRECTION_RX) {
 			if (soc->cdp_soc.ol_ops->config_lite_mon_peer)
 				soc->cdp_soc.ol_ops->config_lite_mon_peer(soc->ctrl_psoc,
 								  pdev->pdev_id,
 								  peer->vdev_id,
 								  CDP_NAC_PARAM_DEL,
 								  &peer->peer_mac.raw[0]);
-		} else if (config->direction == CDP_LITE_MON_DIRECTION_TX) {
+		} else if (dir == CDP_LITE_MON_DIRECTION_TX) {
 			if (soc->cdp_soc.ol_ops->config_lite_mon_tx_peer) {
 				if (config->peer_count == 1)
 					cmd = CDP_TX_FILTER_ACTION_CLEAR_FILTERING;
@@ -362,7 +364,8 @@ dp_lite_mon_disable_tx(struct dp_pdev *pdev)
 		dp_mon_err("Failed to reset tx lite mon filters");
 
 	/*free peer*/
-	dp_lite_mon_free_peers(pdev, &lite_mon_tx_config->tx_config);
+	dp_lite_mon_free_peers(pdev, &lite_mon_tx_config->tx_config,
+			       CDP_LITE_MON_DIRECTION_TX);
 	/* reset tx lite mon config */
 	dp_lite_mon_reset_config(pdev, &lite_mon_tx_config->tx_config);
 	lite_mon_tx_config->subtype_filtering = false;
@@ -403,7 +406,8 @@ dp_lite_mon_disable_rx(struct dp_pdev *pdev)
 		dp_mon_err("Failed to reset rx lite mon filters");
 
 	/*free peer*/
-	dp_lite_mon_free_peers(pdev, &lite_mon_rx_config->rx_config);
+	dp_lite_mon_free_peers(pdev, &lite_mon_rx_config->rx_config,
+			       CDP_LITE_MON_DIRECTION_RX);
 	/* reset rx lite mon config */
 	dp_lite_mon_reset_config(pdev, &lite_mon_rx_config->rx_config);
 	qdf_spin_unlock_bh(&lite_mon_rx_config->lite_mon_rx_lock);
@@ -2250,6 +2254,7 @@ void
 dp_lite_mon_vdev_delete(struct dp_pdev *pdev, struct dp_vdev *vdev)
 {
 	struct dp_pdev_be *be_pdev = dp_get_be_pdev_from_dp_pdev(pdev);
+	struct dp_soc *soc = pdev->soc;
 	struct dp_mon_pdev_be *be_mon_pdev =
 			(struct dp_mon_pdev_be *)be_pdev->pdev.monitor_pdev;
 	struct dp_lite_mon_config *config;
@@ -2276,6 +2281,7 @@ dp_lite_mon_vdev_delete(struct dp_pdev *pdev, struct dp_vdev *vdev)
 	}
 
 	if (be_mon_pdev->lite_mon_rx_config) {
+		qdf_spin_lock_bh(&be_mon_pdev->lite_mon_rx_config->lite_mon_rx_lock);
 		config = &be_mon_pdev->lite_mon_rx_config->rx_config;
 		if (config->lite_mon_vdev &&
 		    config->lite_mon_vdev == vdev)
@@ -2287,11 +2293,18 @@ dp_lite_mon_vdev_delete(struct dp_pdev *pdev, struct dp_vdev *vdev)
 				if (peer->vdev_id == vdev->vdev_id) {
 					TAILQ_REMOVE(&config->peer_list, peer,
 						     peer_list_elem);
+					if (soc->cdp_soc.ol_ops->config_lite_mon_peer)
+						soc->cdp_soc.ol_ops->config_lite_mon_peer(soc->ctrl_psoc,
+										  pdev->pdev_id,
+										  peer->vdev_id,
+										  CDP_NAC_PARAM_DEL,
+										  &peer->peer_mac.raw[0]);
 					config->peer_count--;
 					qdf_mem_free(peer);
 				}
 			}
 		}
+		qdf_spin_unlock_bh(&be_mon_pdev->lite_mon_rx_config->lite_mon_rx_lock);
 	}
 }
 
